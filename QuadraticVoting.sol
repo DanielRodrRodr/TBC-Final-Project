@@ -178,7 +178,7 @@ contract QuadraticVoting {
     function sellTokens(uint256 amount) external onlyParticipant {
         require(token.balanceOf(msg.sender) >= amount, "Saldo insuficiente");
 
-        token.burn(msg.sender, amount);
+        token.burn(amount);
 
         (bool success, ) = msg.sender.call{value: amount * tokenPrice}("");
         require(success, "Error al enviar ETH");
@@ -191,13 +191,13 @@ contract QuadraticVoting {
     function getPendingProposals() isOpen external view returns(uint[] memory ids)  {
         uint count;
         for (uint i = 0; i < proposals.length; i++)
-            if (!proposals[i].approved && !proposals[i].canceled && !proposals[i].signaling)
+            if (!proposals[i].approved && !proposals[i].canceled)
                 count++;
         ids = new uint[](count);
 
         uint j = 0;
         for (uint i = 0; i < proposals.length; i++)
-            if (!proposals[i].approved && !proposals[i].canceled && !proposals[i].signaling)
+            if (!proposals[i].approved && !proposals[i].canceled)
                 ids[j++] = i;
     }
 
@@ -232,19 +232,20 @@ contract QuadraticVoting {
     }
 
     function stake(uint256 id, uint256 numVotes) external onlyParticipant isOpen {
-        //Hay que mirar que no se pueda cancelar mientras se ejecuta stake y algo de añadir votersKeys
+        
         Proposal storage p = proposals[id];
         require(!p.approved && !p.canceled, "No valida");
 
         uint256 prevVotes = votesPerUser[id][msg.sender];
         uint256 newVotes = prevVotes + numVotes;
-
         uint256 cost = (newVotes * newVotes) - (prevVotes * prevVotes);
 
-        token.transfer(msg.sender, cost);
+        token.transferFrom(msg.sender, address(this), cost);
 
         votesPerUser[id][msg.sender] = newVotes;
         tokensUsed[id][msg.sender] += cost;
+
+        votersKeys[id].push(msg.sender);
 
         p.voteCount += numVotes;
         p.tokensCollected += cost;
@@ -255,6 +256,7 @@ contract QuadraticVoting {
     function withdrawFromProposal(uint256 id, uint256 votesToRemove) external {
 
         Proposal storage p = proposals[id];
+
         require(!p.approved && !p.canceled, "No permitido");
 
         uint256 prevVotes = votesPerUser[id][msg.sender];
@@ -276,19 +278,25 @@ contract QuadraticVoting {
     function _checkAndExecuteProposal(uint256 id) internal {
 
         Proposal storage p = proposals[id];
+
         if (p.signaling || p.approved || p.canceled) return;
 
-        uint256 pending = _pendingProposals();
+        uint256 pending = 0;
+        for (uint i = 0; i < proposals.length; i++) {
+            if (!proposals[i].approved && !proposals[i].canceled && !proposals[i].signaling) {
+                pending++;
+            }
+        }
 
-        uint256 threshold = (((p.budget * 1e18) / budget + 2e17) * numParticipants) / 1e18 + pending;
+        uint256 threshold = ((20 + (p.budget * 100) / budget) * numParticipants) / 100 + pending;
 
         if (p.voteCount >= threshold && budget >= p.budget) {
 
             p.approved = true;
-            uint256 tokens = p.tokensCollected;
 
-            budget += p.tokensCollected;
             budget -= p.budget;
+
+            token.burn(p.tokensCollected);
 
             (bool success, ) = p.executable.call{value: p.budget, gas: 100000}(
                 abi.encodeWithSignature(
@@ -303,19 +311,16 @@ contract QuadraticVoting {
         }
     }
 
-   
     function closeVoting() external onlyOwner {
 
         votingOpen = false;
 
         for (uint i = 0; i < proposals.length; i++) {
-            Proposal storage p = proposals[i];
 
+            Proposal storage p = proposals[i];
             address[] memory addr = votersKeys[i];
 
-            // signaling → ejecutar + devolver tokens
             if (p.signaling) {
-
                 (bool success, ) = p.executable.call{gas: 100000}(
                     abi.encodeWithSignature(
                         "executeProposal(uint256,uint256,uint256)",
@@ -324,21 +329,10 @@ contract QuadraticVoting {
                         p.tokensCollected
                     )
                 );
-
                 require(success);
-
-                for (uint j = 0; j < addr.length; j++) {
-                    address user = addr[j];
-                    uint256 amount = tokensUsed[i][user];
-
-                    if (amount > 0) {
-                        token.transfer(user, amount);
-                    }
-                }
             }
 
-            // funding no aprobadas → devolver tokens
-            else if (!p.approved) {
+            if (p.signaling || !p.approved) {
                 for (uint j = 0; j < addr.length; j++) {
                     address user = addr[j];
                     uint256 amount = tokensUsed[i][user];

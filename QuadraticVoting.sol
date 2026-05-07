@@ -3,8 +3,9 @@ pragma solidity >=0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 
-interface IExecutableProposal {
+interface IExecutableProposal is IERC165 {
     function executeProposal(uint proposalId, uint numVotes, uint numTokens) external payable;
 }
 
@@ -19,8 +20,8 @@ contract VotingToken is ERC20, Ownable {
         _mint(to, amount);
     }
 
-    function burn(uint256 amount) external onlyOwner {
-        _burn(address(this), amount);
+    function burn(address from, uint256 amount) external onlyOwner {
+        _burn(from, amount);
     }
 }
 
@@ -54,7 +55,7 @@ contract QuadraticVoting {
     Proposal[] public proposals;
 
     mapping(address => bool) public participants;
-    mapping(uint256 => address[] users) public votersKeys; ///////////////////////////////
+    mapping(uint256 => address[] users) public votersKeys;
     mapping(uint256 => mapping(address => uint256)) public votesPerUser;
     mapping(uint256 => mapping(address => uint256)) public tokensUsed;
 
@@ -117,11 +118,9 @@ contract QuadraticVoting {
 
     function addProposal(string memory title,string memory description, uint256 _budget, address executable) external onlyParticipant isOpen returns(uint256) {
 
+        require(executable != address(0), "Direccion invalida");
+        require(IERC165(executable).supportsInterface(type(IExecutableProposal).interfaceId), "No implementa IExecutableProposal");
         bool signaling = (_budget == 0);
-
-        if (!signaling) {
-            require(executable != address(0), "Direccion invalida");
-        }
 
         proposals.push(Proposal({
             title: title,
@@ -154,8 +153,10 @@ contract QuadraticVoting {
 
             if (amount > 0)
                 token.transfer(user, amount);
+            
+            tokensUsed[id][user] = 0;
+            votesPerUser[id][user] = 0;
         }
-
         p.voteCount = 0;
         p.tokensCollected = 0;
     }
@@ -178,7 +179,7 @@ contract QuadraticVoting {
     function sellTokens(uint256 amount) external onlyParticipant {
         require(token.balanceOf(msg.sender) >= amount, "Saldo insuficiente");
 
-        token.burn(amount);
+        token.burn(msg.sender, amount);
 
         (bool success, ) = msg.sender.call{value: amount * tokenPrice}("");
         require(success, "Error al enviar ETH");
@@ -191,13 +192,13 @@ contract QuadraticVoting {
     function getPendingProposals() isOpen external view returns(uint[] memory ids)  {
         uint count;
         for (uint i = 0; i < proposals.length; i++)
-            if (!proposals[i].approved && !proposals[i].canceled)
+            if (!proposals[i].approved && !proposals[i].canceled && !proposals[i].signaling)
                 count++;
         ids = new uint[](count);
 
         uint j = 0;
         for (uint i = 0; i < proposals.length; i++)
-            if (!proposals[i].approved && !proposals[i].canceled)
+            if (!proposals[i].approved && !proposals[i].canceled && !proposals[i].signaling)
                 ids[j++] = i;
     }
 
@@ -233,6 +234,7 @@ contract QuadraticVoting {
 
     function stake(uint256 id, uint256 numVotes) external onlyParticipant isOpen {
         
+        require(numVotes > 0, "Hay que aportar algun voto");
         Proposal storage p = proposals[id];
         require(!p.approved && !p.canceled, "No valida");
 
@@ -240,12 +242,16 @@ contract QuadraticVoting {
         uint256 newVotes = prevVotes + numVotes;
         uint256 cost = (newVotes * newVotes) - (prevVotes * prevVotes);
 
+        require(token.balanceOf(msg.sender) >= cost);
+        require(token.allowance(msg.sender, address(this)) >= cost);
         token.transferFrom(msg.sender, address(this), cost);
+
+
+        if (votesPerUser[id][msg.sender] == 0)
+            votersKeys[id].push(msg.sender);
 
         votesPerUser[id][msg.sender] = newVotes;
         tokensUsed[id][msg.sender] += cost;
-
-        votersKeys[id].push(msg.sender);
 
         p.voteCount += numVotes;
         p.tokensCollected += cost;
@@ -253,7 +259,7 @@ contract QuadraticVoting {
         _checkAndExecuteProposal(id);
     }
 
-    function withdrawFromProposal(uint256 id, uint256 votesToRemove) external {
+    function withdrawFromProposal(uint256 id, uint256 votesToRemove) external isOpen {
 
         Proposal storage p = proposals[id];
 
@@ -293,10 +299,11 @@ contract QuadraticVoting {
         if (p.voteCount >= threshold && budget >= p.budget) {
 
             p.approved = true;
-
+            
+            budget += p.tokensCollected * tokenPrice;
             budget -= p.budget;
 
-            token.burn(p.tokensCollected);
+            token.burn(address(this), p.tokensCollected);
 
             (bool success, ) = p.executable.call{value: p.budget, gas: 100000}(
                 abi.encodeWithSignature(
@@ -322,12 +329,7 @@ contract QuadraticVoting {
 
             if (p.signaling) {
                 (bool success, ) = p.executable.call{gas: 100000}(
-                    abi.encodeWithSignature(
-                        "executeProposal(uint256,uint256,uint256)",
-                        i,
-                        p.voteCount,
-                        p.tokensCollected
-                    )
+                    abi.encodeWithSignature("executeProposal(uint256,uint256,uint256)", i, p.voteCount, p.tokensCollected)
                 );
                 require(success);
             }
@@ -337,9 +339,8 @@ contract QuadraticVoting {
                     address user = addr[j];
                     uint256 amount = tokensUsed[i][user];
 
-                    if (amount > 0) {
+                    if (amount > 0)
                         token.transfer(user, amount);
-                    }
                 }
             }
         }

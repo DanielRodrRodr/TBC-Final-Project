@@ -342,7 +342,10 @@ contract QuadraticVoting {
                     abi.encodeWithSignature("executeProposal(uint256,uint256,uint256)", i, p.voteCount, p.tokensCollected)
                 );
             }
-
+            //Aqui no hemos puesto un require y por eso da el warning, pero es porque propuestas maliciosas que
+            //se aprueben podrían secuestrar el contrato para siempre, poniendo que una de las propuestas
+            //no cumpla el require, haciendo por tal que se revierta todo todo el tiempo y 
+            //que no se pudiese cerrar la votación nunca (esto aplica también para el otro warning).
             for (uint j = 0; j < addr.length; j++) {
                 address user = addr[j];
                 uint256 amount = tokensUsed[i][user];
@@ -363,9 +366,6 @@ contract QuadraticVoting {
         numPending = 0;
         (bool ok, ) = owner.call{value: amountToSend}("");
         require(ok);
-
-        numPending = 0;
-        budget = 0;
     }
 }
 

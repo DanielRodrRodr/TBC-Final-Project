@@ -12,11 +12,12 @@ interface IExecutableProposal is IERC165 {
 contract VotingToken is ERC20, Ownable {
 
     uint256 public maxSupply;
+    uint256 public tokensSold;
 
     constructor(uint256 _maxSupply) ERC20("VotingToken", "VTK") Ownable(msg.sender) { maxSupply = _maxSupply; }
 
     function mint(address to, uint256 amount) external onlyOwner {
-        require(totalSupply() + amount <= maxSupply, "Max supply alcanzado");
+        require(totalSupply() + amount <= maxSupply, "Max tokens alcanzado");
         _mint(to, amount);
     }
 
@@ -35,6 +36,8 @@ contract QuadraticVoting {
     uint256 public budget;
 
     uint256 public numParticipants;
+    
+    uint256 public numPending;
 
     struct Proposal {
         string title;
@@ -96,7 +99,12 @@ contract QuadraticVoting {
 
         uint256 tokensToMint = msg.value / tokenPrice;
 
-        require(token.totalSupply() + tokensToMint <= token.maxSupply(), "Max tokens superado");
+        // limitar al supply disponible antes de mintear
+        uint256 available = token.maxSupply() - token.totalSupply();
+        if (tokensToMint > available) {
+            tokensToMint = available;
+        }
+        require(tokensToMint > 0, "No quedan tokens");
 
         participants[msg.sender] = true;
         numParticipants++;
@@ -135,6 +143,8 @@ contract QuadraticVoting {
             creator: msg.sender
         }));
 
+        if (!signaling) numPending++;
+
         return proposals.length - 1;
     }
 
@@ -146,6 +156,9 @@ contract QuadraticVoting {
         require(!p.canceled, "Ya cancelada");
 
         p.canceled = true;
+        if (!p.signaling)
+            numPending--;
+        
         address[] memory addr = votersKeys[id];
         for (uint i = 0; i < addr.length; i++) {
             address user = addr[i];
@@ -163,6 +176,10 @@ contract QuadraticVoting {
 
     function buyTokens() external payable onlyParticipant {
         uint256 tokensToMint = msg.value / tokenPrice;
+        uint256 available = token.maxSupply() - token.totalSupply();
+        if (tokensToMint > available) {
+            tokensToMint = available;
+        }
         require(tokensToMint > 0, "Compra minima 1 token");
 
         uint256 cost = tokensToMint * tokenPrice;
@@ -176,7 +193,7 @@ contract QuadraticVoting {
         }
     }
 
-    function sellTokens(uint256 amount) external onlyParticipant {
+    function sellTokens(uint256 amount) external {
         require(token.balanceOf(msg.sender) >= amount, "Saldo insuficiente");
 
         token.burn(msg.sender, amount);
@@ -246,8 +263,7 @@ contract QuadraticVoting {
         require(token.allowance(msg.sender, address(this)) >= cost);
         token.transferFrom(msg.sender, address(this), cost);
 
-
-        if (votesPerUser[id][msg.sender] == 0)
+        if (votesPerUser[id][msg.sender] == 0 && tokensUsed[id][msg.sender] == 0)
             votersKeys[id].push(msg.sender);
 
         votesPerUser[id][msg.sender] = newVotes;
@@ -259,7 +275,7 @@ contract QuadraticVoting {
         _checkAndExecuteProposal(id);
     }
 
-    function withdrawFromProposal(uint256 id, uint256 votesToRemove) external isOpen {
+    function withdrawFromProposal(uint256 id, uint256 votesToRemove) external onlyParticipant isOpen {
 
         Proposal storage p = proposals[id];
 
@@ -287,25 +303,20 @@ contract QuadraticVoting {
 
         if (p.signaling || p.approved || p.canceled) return;
 
-        uint256 pending = 0;
-        for (uint i = 0; i < proposals.length; i++) {
-            if (!proposals[i].approved && !proposals[i].canceled && !proposals[i].signaling) {
-                pending++;
-            }
-        }
-
-        uint256 threshold = ((20 + (p.budget * 100) / budget) * numParticipants) / 100 + pending;
+        uint256 budgetRatio = budget == 0 ? 0 : (p.budget * 100) / budget;
+        uint256 threshold = ((20 + budgetRatio) * numParticipants) / 100 + numPending;
 
         if (p.voteCount >= threshold && budget >= p.budget) {
 
             p.approved = true;
+            numPending--;
             
             budget += p.tokensCollected * tokenPrice;
             budget -= p.budget;
 
             token.burn(address(this), p.tokensCollected);
 
-            (bool success, ) = p.executable.call{value: p.budget, gas: 100000}(
+            p.executable.call{value: p.budget, gas: 100000}(
                 abi.encodeWithSignature(
                     "executeProposal(uint256,uint256,uint256)",
                     id,
@@ -313,8 +324,6 @@ contract QuadraticVoting {
                     p.tokensCollected
                 )
             );
-
-            require(success, "Fallo ejecucion");
         }
     }
 
@@ -327,27 +336,48 @@ contract QuadraticVoting {
             Proposal storage p = proposals[i];
             address[] memory addr = votersKeys[i];
 
-            if (p.signaling) {
-                (bool success, ) = p.executable.call{gas: 100000}(
+            if (p.signaling && !p.canceled) {
+                p.executable.call{gas: 100000}(
                     abi.encodeWithSignature("executeProposal(uint256,uint256,uint256)", i, p.voteCount, p.tokensCollected)
                 );
-                require(success);
             }
 
-            if (p.signaling || !p.approved) {
-                for (uint j = 0; j < addr.length; j++) {
-                    address user = addr[j];
-                    uint256 amount = tokensUsed[i][user];
+            for (uint j = 0; j < addr.length; j++) {
+                address user = addr[j];
+                uint256 amount = tokensUsed[i][user];
 
-                    if (amount > 0)
-                        token.transfer(user, amount);
-                }
+                if (amount > 0 && (p.signaling || !p.approved))
+                    token.transfer(user, amount);
+
+                tokensUsed[i][user] = 0;
+                votesPerUser[i][user] = 0;
             }
+
+            delete votersKeys[i];
         }
+        delete proposals;
 
-        (bool ok, ) = owner.call{value: budget}("");
+        uint256 amountToSend = budget;
+        budget = 0;
+        numPending = 0;
+        (bool ok, ) = owner.call{value: amountToSend}("");
         require(ok);
 
+        numPending = 0;
         budget = 0;
     }
+}
+
+contract TestProposal is IExecutableProposal {
+    event Executed(uint proposalId, uint numVotes, uint numTokens, uint balance);
+
+    function supportsInterface(bytes4 interfaceId) external pure override returns (bool) {
+        return interfaceId == type(IExecutableProposal).interfaceId;
+    }
+
+    function executeProposal(uint proposalId, uint numVotes, uint numTokens) external payable override {
+        emit Executed(proposalId, numVotes, numTokens, address(this).balance);
+    }
+
+    receive() external payable {}
 }

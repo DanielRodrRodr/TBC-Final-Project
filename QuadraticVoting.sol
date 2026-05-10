@@ -12,11 +12,13 @@ interface IExecutableProposal is IERC165 {
 contract VotingToken is ERC20, Ownable {
 
     uint256 public maxSupply;
+    uint256 public tokensSold;
 
     constructor(uint256 _maxSupply) ERC20("VotingToken", "VTK") Ownable(msg.sender) { maxSupply = _maxSupply; }
 
     function mint(address to, uint256 amount) external onlyOwner {
-        require(totalSupply() + amount <= maxSupply, "Max supply alcanzado");
+        require(tokensSold + amount <= maxSupply, "Max tokens alcanzado");
+        tokensSold += amount;
         _mint(to, amount);
     }
 
@@ -35,6 +37,8 @@ contract QuadraticVoting {
     uint256 public budget;
 
     uint256 public numParticipants;
+    
+    uint256 public numPending;
 
     struct Proposal {
         string title;
@@ -96,7 +100,14 @@ contract QuadraticVoting {
 
         uint256 tokensToMint = msg.value / tokenPrice;
 
-        require(token.totalSupply() + tokensToMint <= token.maxSupply(), "Max tokens superado");
+        // limitar al supply disponible antes de mintear
+        uint256 available = token.maxSupply() - token.totalSupply();
+        if (tokensToMint > available) {
+            tokensToMint = available;
+        }
+        require(tokensToMint > 0, "No quedan tokens");
+
+        //require(token.totalSupply() + tokensToMint <= token.maxSupply(), "Max tokens superado");
 
         participants[msg.sender] = true;
         numParticipants++;
@@ -135,6 +146,8 @@ contract QuadraticVoting {
             creator: msg.sender
         }));
 
+        if (!signaling) numPending++;
+
         return proposals.length - 1;
     }
 
@@ -146,6 +159,9 @@ contract QuadraticVoting {
         require(!p.canceled, "Ya cancelada");
 
         p.canceled = true;
+        if (!p.signaling)
+            numPending--;
+        
         address[] memory addr = votersKeys[id];
         for (uint i = 0; i < addr.length; i++) {
             address user = addr[i];
@@ -246,7 +262,6 @@ contract QuadraticVoting {
         require(token.allowance(msg.sender, address(this)) >= cost);
         token.transferFrom(msg.sender, address(this), cost);
 
-
         if (votesPerUser[id][msg.sender] == 0)
             votersKeys[id].push(msg.sender);
 
@@ -259,7 +274,7 @@ contract QuadraticVoting {
         _checkAndExecuteProposal(id);
     }
 
-    function withdrawFromProposal(uint256 id, uint256 votesToRemove) external isOpen {
+    function withdrawFromProposal(uint256 id, uint256 votesToRemove) external onlyParticipant isOpen {
 
         Proposal storage p = proposals[id];
 
@@ -287,18 +302,20 @@ contract QuadraticVoting {
 
         if (p.signaling || p.approved || p.canceled) return;
 
-        uint256 pending = 0;
-        for (uint i = 0; i < proposals.length; i++) {
-            if (!proposals[i].approved && !proposals[i].canceled && !proposals[i].signaling) {
-                pending++;
-            }
-        }
+        //uint256 pending = 0;
+        // for (uint i = 0; i < proposals.length; i++) {
+        //     if (!proposals[i].approved && !proposals[i].canceled && !proposals[i].signaling) {
+        //         pending++;
+        //     }
+        // }
+        uint256 pending = numPending;
 
         uint256 threshold = ((20 + (p.budget * 100) / budget) * numParticipants) / 100 + pending;
 
         if (p.voteCount >= threshold && budget >= p.budget) {
 
             p.approved = true;
+            numPending--;
             
             budget += p.tokensCollected * tokenPrice;
             budget -= p.budget;
@@ -348,6 +365,21 @@ contract QuadraticVoting {
         (bool ok, ) = owner.call{value: budget}("");
         require(ok);
 
+        numPending = 0;
         budget = 0;
     }
+}
+
+contract TestProposal is IExecutableProposal {
+    event Executed(uint proposalId, uint numVotes, uint numTokens, uint balance);
+
+    function supportsInterface(bytes4 interfaceId) external pure override returns (bool) {
+        return interfaceId == type(IExecutableProposal).interfaceId;
+    }
+
+    function executeProposal(uint proposalId, uint numVotes, uint numTokens) external payable override {
+        emit Executed(proposalId, numVotes, numTokens, address(this).balance);
+    }
+
+    receive() external payable {}
 }

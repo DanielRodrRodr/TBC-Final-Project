@@ -12,7 +12,6 @@ interface IExecutableProposal is IERC165 {
 contract VotingToken is ERC20, Ownable {
 
     uint256 public maxSupply;
-    uint256 public tokensSold;
 
     constructor(uint256 _maxSupply) ERC20("VotingToken", "VTK") Ownable(msg.sender) { maxSupply = _maxSupply; }
 
@@ -163,12 +162,12 @@ contract QuadraticVoting {
         for (uint i = 0; i < addr.length; i++) {
             address user = addr[i];
             uint256 amount = tokensUsed[id][user];
+            tokensUsed[id][user] = 0;
+            votesPerUser[id][user] = 0;
 
             if (amount > 0)
                 token.transfer(user, amount);
             
-            tokensUsed[id][user] = 0;
-            votesPerUser[id][user] = 0;
         }
         p.voteCount = 0;
         p.tokensCollected = 0;
@@ -261,7 +260,6 @@ contract QuadraticVoting {
 
         require(token.balanceOf(msg.sender) >= cost);
         require(token.allowance(msg.sender, address(this)) >= cost);
-        token.transferFrom(msg.sender, address(this), cost);
 
         if (votesPerUser[id][msg.sender] == 0 && tokensUsed[id][msg.sender] == 0)
             votersKeys[id].push(msg.sender);
@@ -271,6 +269,7 @@ contract QuadraticVoting {
 
         p.voteCount += numVotes;
         p.tokensCollected += cost;
+        token.transferFrom(msg.sender, address(this), cost);
 
         _checkAndExecuteProposal(id);
     }
@@ -330,7 +329,9 @@ contract QuadraticVoting {
     function closeVoting() external onlyOwner {
 
         votingOpen = false;
-
+        //El doble bucle for es peligroso podría hacer gastar una cantidad de gas increible, 
+        //lo mejor podría ser crear otra función y que cada usuario reclame la parte que le corresponde 
+        //y esta función solo cambie el estado  voting open y la otra solo se pueda llamar con open voting false.
         for (uint i = 0; i < proposals.length; i++) {
 
             Proposal storage p = proposals[i];
@@ -345,12 +346,12 @@ contract QuadraticVoting {
             for (uint j = 0; j < addr.length; j++) {
                 address user = addr[j];
                 uint256 amount = tokensUsed[i][user];
+                tokensUsed[i][user] = 0;
+                votesPerUser[i][user] = 0;
 
                 if (amount > 0 && (p.signaling || !p.approved))
                     token.transfer(user, amount);
 
-                tokensUsed[i][user] = 0;
-                votesPerUser[i][user] = 0;
             }
 
             delete votersKeys[i];
